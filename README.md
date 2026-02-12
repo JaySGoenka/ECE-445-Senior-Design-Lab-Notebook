@@ -1,0 +1,1 @@
+This is my lab notebook for ECE 445 Senior Design Project. Its my central source to brainstorm, make notes, and enter any information relevant to the development of this project. 
