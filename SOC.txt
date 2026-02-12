@@ -1,0 +1,2 @@
+- A shunt resistor is a precision, low-resistance component placed in a circuit to measure high electric currents by creating a proportional, small voltage drop. 
+- 
