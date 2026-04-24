@@ -1,408 +1,63 @@
-# Smart BMS – SOC Estimation Notes
+# SOC and SOH Estimation Notes
 
-## 1. System Overview
+I looked more closely at the SOC/SOH calculation steps because these values can look precise even when the inputs are not fully proven. Cell voltage, current calibration, elapsed time, and the assumed pack capacity all affect the final number. For our prototype, I think it is better to show the method clearly and keep the limitations visible.
 
-The goal of the Battery Management System (BMS) is to accurately estimate the State of Charge (SOC) of a Li-ion battery pack during both charging and deployment in a UAV system.
+The SOC calculation is a hybrid of voltage estimate and coulomb counting:
 
-SOC estimation requires:
-- Accurate current measurement
-- Accurate voltage measurement
-- Temperature monitoring
-- A robust estimation algorithm (Coulomb counting + Kalman filter)
+- start with an SOC estimate from average cell voltage
+- after startup, subtract charge used based on pack current and elapsed time
+- ignore tiny currents below the noise floor so offset drift does not slowly drain SOC
+- if the pack is resting at low current, blend SOC back toward the voltage-based estimate
+- force SOC near zero if the minimum cell reaches the empty-cell cutoff
+- clamp the final value between 0% and 100%
 
----
+The voltage estimate uses an approximate Li-ion open-circuit voltage curve. It is not just a straight line from 3.0 V to 4.2 V because the middle of the discharge curve is flatter. The rough lookup points I am using are:
 
-## 2. Current Measurement
+- 3.00 V is 0%
+- 3.30 V is about 5%
+- 3.50 V is about 12%
+- 3.60 V is about 22%
+- 3.70 V is about 35%
+- 3.75 V jumps up near 76%
+- 3.80 V is about 80%
+- 3.90 V is about 88%
+- 4.00 V is about 94%
+- 4.10 V is about 98%
+- 4.20 V is 100%
 
-### 2.1 Shunt Resistor
+That curve is only a startup/rest correction, not the whole SOC answer. Under load, cell voltage sags, so using voltage directly can make the pack look more discharged than it really is. That is why the current integration matters once the pack is actively discharging.
 
-A shunt resistor is a precision, low-resistance component placed in series with the battery to measure current.
+For coulomb counting, the basic step is:
 
-It works using Ohm’s Law:
+`SOC_drop_percent = Ipack * dt * 100 / (capacity_Ah * 3600)`
 
-V_shunt = I × R_shunt
+The capacity value I am using right now is 2.2 Ah. Current below about 0.10 A is treated as zero for SOC integration so sensor noise and offset do not accumulate forever. I also cap each time step so one delayed packet or timestamp jump does not create a huge fake SOC drop.
 
-Where:
-- V_shunt is a small voltage drop (typically millivolts)
-- I is battery current
-- R_shunt is typically 1–5 mΩ
+Rest correction is a small compromise. If the current stays below about 0.15 A for a few seconds, the pack is treated as close enough to resting that voltage is more useful again. Instead of snapping SOC straight to the voltage estimate, I blend partway toward it. This avoids sudden jumps but still corrects slow drift from coulomb counting.
 
-Important design trade-offs:
-- Lower resistance → less power loss but smaller measurable voltage
-- Higher resistance → better signal resolution but more heat dissipation
+Cutoff behavior is based on the minimum cell, not just average voltage. If the lowest cell is at or below 3.00 V, SOC should be treated as 0%. If the lowest cell is only slightly above that, around 3.05 V, SOC should be limited to a very low value. This is important because a healthy-looking average can hide one weak cell.
 
-Power dissipation:
-P = I²R
+SOH is based on measured discharge capacity. The idea is:
 
----
+- start a discharge cycle when real discharge current is present
+- only trust a cycle for SOH if it started from a high SOC, around 90% or more
+- integrate discharged amp-hours during the cycle
+- end the cycle when current drops close to idle and the minimum cell is near the cutoff voltage
+- compare measured discharged Ah against nominal capacity
 
-### 2.2 High-Side Current Sensing
+The SOH equation is:
 
-The shunt resistor is placed on the high side (between battery positive and load).
+`SOH_percent = measured_discharge_capacity_Ah / nominal_capacity_Ah * 100`
 
-Advantages:
-- Detects short-to-ground faults
-- Preserves system ground reference
-- More suitable for UAV systems
+Using the 2.2 Ah nominal capacity, a measured discharge of 2.178 Ah would be about 99% SOH. A measured discharge of 2.156 Ah would be about 98% SOH. This makes sense as a capacity-based estimate, but it depends heavily on having a real full-to-empty discharge and a calibrated current measurement.
 
----
+Things I still need to be careful about:
 
-### 2.3 Current Sense Amplifier (INA240)
+- zero-current offset has to be measured
+- the current sign convention has to be right
+- current should be checked against a known load
+- SOC should not keep drifting when current is actually zero
+- SOH should not be updated from a partial discharge that did not start near full
+- voltage-based SOC should only be trusted more when the pack is resting
 
-The shunt voltage is amplified using a high-side current sense amplifier.
-
-Requirements:
-- High common-mode rejection
-- PWM noise rejection
-- Accurate gain
-- Low offset voltage
-
----
-
-### 2.4 Signal Conditioning
-
-An RC low-pass filter is added before the ADC input to remove high-frequency PWM noise.
-
-Cutoff frequency must balance:
-- Noise suppression
-- Transient response accuracy
-
----
-
-### 2.5 ADC Requirements
-
-ADC must provide:
-- Sufficient resolution (12–16 bit)
-- Stable reference voltage
-- Low noise
-
-Resolution impacts SOC accuracy directly.
-
----
-
-## 3. Voltage Measurements
-
-Voltage measurement is required for:
-
-- Open Circuit Voltage (OCV) based SOC correction  
-- Over-voltage protection  
-- Under-voltage protection  
-- Cell balancing decisions  
-- Health monitoring  
-
-In a UAV BMS, both **pack-level voltage** and **individual cell voltages** must be monitored.
-
----
-
-### 3.1 Measurement Objectives
-
-The voltage measurement subsystem must:
-
-- Measure maximum pack voltage safely (e.g., 4S Li-ion ≈ 16.8 V max)
-- Provide sufficient resolution for SOC correction
-- Introduce minimal loading on the battery
-- Maintain low noise during high PWM motor activity
-
----
-
-### 3.2 Resistor Divider for Pack Voltage
-
-Since the MCU ADC cannot tolerate voltages above its reference (typically 3.3 V), a resistor divider is used to scale down battery voltage.
-
-Voltage divider equation:
-
-V_ADC = V_BAT × (R2 / (R1 + R2))
-
-Example design for 4S Li-ion:
-
-- Max battery voltage: 16.8 V  
-- ADC reference: 3.3 V  
-- Target ADC max: 3.0 V (safety margin)
-
-Design ratio:
-
-R2 / (R1 + R2) ≈ 0.18
-
-Example component selection:
-
-- R1 = 82kΩ  
-- R2 = 18kΩ  
-
----
-
-### 3.3 Design Trade-offs
-
-#### 1. Power Dissipation
-
-The divider continuously draws current:
-
-I = V_BAT / (R1 + R2)
-
-For 100kΩ total at 16V:
-
-I ≈ 160 µA
-
-This is acceptable for UAV systems but should be minimized in ultra-low-power designs.
-
----
-
-#### 2. Accuracy
-
-Voltage measurement error directly impacts SOC correction.
-
-Error sources:
-- Resistor tolerance (1%, 0.1%)
-- Temperature coefficient
-- ADC reference drift
-- PCB leakage
-- Noise from PWM switching
-
-Design recommendations:
-- Use 0.1% resistors for improved SOC accuracy
-- Use proper PCB layout with short traces
-- Add RC filtering at ADC input
-
----
-
-### 3.4 RC Filtering
-
-A capacitor is added across R2 to create a low-pass filter.
-
-Purpose:
-- Remove high-frequency switching noise
-- Stabilize ADC sampling
-
-Cutoff frequency:
-
-f_c = 1 / (2πR_eqC)
-
-Must be chosen carefully:
-- Too low → slow response to voltage transients
-- Too high → insufficient noise filtering
-
-Typical cutoff range: 10–100 Hz for SOC measurement.
-
----
-
-### 3.5 Cell-Level Voltage Monitoring
-
-For multi-cell packs, each cell must be monitored individually.
-
-Reasons:
-- Prevent overcharge (>4.2 V)
-- Prevent undervoltage (<3.0 V)
-- Enable passive or active balancing
-
-For higher cell counts, dedicated battery monitor ICs are preferred over simple resistor dividers.
-
----
-
-## 4. Temperature Sensing, ADC, and MCU
-
-Temperature is critical in Li-ion systems because:
-
-- Internal resistance increases with temperature
-- Capacity varies with temperature
-- High temperature accelerates degradation
-- Thermal runaway risk exists
-
----
-
-### 4.1 Temperature Sensing
-
-Most BMS designs use:
-
-- NTC thermistors (most common)
-- Digital temperature sensors (less common for battery packs)
-
----
-
-#### NTC Thermistor
-
-An NTC (Negative Temperature Coefficient) thermistor decreases resistance as temperature increases.
-
-It is typically placed:
-
-- On the cell surface
-- Near high-current MOSFETs
-- Near the shunt resistor
-
----
-
-#### Thermistor Measurement Circuit
-
-The thermistor is used in a resistor divider configuration:
-
-Vref ── R_fixed ──┬── ADC
-                  │
-               NTC thermistor
-                  │
-                 GND
-
-The measured voltage corresponds to temperature via the Steinhart–Hart equation.
-
----
-
-#### Why Temperature Matters for SOC
-
-SOC algorithms require temperature compensation because:
-
-- OCV vs SOC curves shift with temperature
-- Internal resistance changes
-- Capacity (C_nominal) varies
-
-Without temperature compensation, SOC error increases significantly.
-
----
-
-### 4.2 ADC Requirements
-
-The Analog-to-Digital Converter (ADC) converts analog voltage signals into digital values.
-
-The ADC must measure:
-
-- Shunt amplifier output (current)
-- Divider output (voltage)
-- Thermistor output (temperature)
-
----
-
-#### Resolution
-
-Resolution determines the smallest measurable voltage change.
-
-For a 12-bit ADC:
-
-Resolution = V_ref / 4096
-
-If V_ref = 3.3 V:
-
-LSB ≈ 0.8 mV
-
-Higher resolution (e.g., 16-bit external ADC) improves:
-
-- Current precision
-- SOC drift performance
-- Kalman filter stability
-
----
-
-#### Sampling Rate
-
-Sampling must be high enough to:
-
-- Capture current dynamics
-- Support accurate Coulomb counting
-
-Typical BMS sampling:
-- 1–10 kHz for current
-- 10–100 Hz for voltage and temperature
-
----
-
-#### ADC Error Sources
-
-- Quantization error
-- Reference drift
-- Offset error
-- Gain error
-- Noise
-
-These errors propagate directly into SOC estimation.
-
----
-
-### 4.3 MCU (Microcontroller Unit)
-
-The MCU is the central controller of the BMS.
-
-It performs:
-
-- ADC data acquisition
-- Coulomb counting
-- Kalman filtering
-- Protection logic
-- Communication with flight controller
-
-Common MCU vendors include:
-
-- STMicroelectronics  
-- NXP Semiconductors  
-- Microchip Technology  
-
----
-
-#### MCU Requirements for This BMS
-
-- Multiple ADC channels
-- DMA support for continuous sampling
-- Floating-point unit (for Kalman filter efficiency)
-- SPI/I2C communication interfaces
-- Low power modes
-- Sufficient RAM for filtering and state estimation
-
----
-
-### 4.4 Firmware Responsibilities
-
-The firmware must:
-
-1. Sample current at fixed interval Δt  
-2. Integrate current for Coulomb counting  
-3. Periodically correct SOC using voltage and temperature models  
-4. Apply safety protections  
-5. Log and transmit diagnostic data  
-
----
-
-## System Measurement Chain Summary
-
-Battery  
-→ Sensors (Shunt / Divider / Thermistor)  
-→ Analog Conditioning  
-→ ADC  
-→ MCU  
-→ SOC Estimation Algorithm  
-
-The ultimate accuracy of SOC estimation is fundamentally limited by the precision, stability, and noise performance of these measurement subsystems.
-
-
-
-## 5. SOC Estimation Methods
-
-### 5.1 Coulomb Counting
-
-SOC(t) = SOC(t0) - (1/C_nominal) ∫ I(t) dt
-
-Limitations:
-- Accumulates drift over time
-- Sensitive to current measurement error
-
----
-
-### 5.2 Kalman Filter
-
-Used to correct drift by:
-- Comparing measured voltage
-- Using battery model (OCV + internal resistance)
-- Updating SOC estimate
-
----
-
-## 6. Error Sources
-
-- Shunt tolerance
-- Amplifier offset
-- ADC quantization
-- Temperature variation
-- Battery aging
-
----
-
-## 7. Design Requirements for UAV
-
-- High dynamic current handling
-- Minimal power loss
-- High noise immunity
-- Real-time SOC update
-- Safe operation in both charging and deployment modes
+Main note: SOC and SOH are useful user-facing estimates, but protection should still rely more directly on cell voltage, temperature, and fault flags. I should not present SOC/SOH as fully validated until current calibration and discharge testing are actually done.
